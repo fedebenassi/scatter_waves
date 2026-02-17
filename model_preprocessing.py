@@ -6,6 +6,7 @@ from utils import getConfigurationByID,daysBetweenDates
 import numpy as np
 from natsort import natsorted
 from scipy.spatial import KDTree
+from scipy.interpolate import LinearNDInterpolator, interp1d
 
 
 class Reader():
@@ -14,6 +15,10 @@ class Reader():
         self.model=model
         self.dataset=dataset
         self.sat_points=sat_points
+        if "interp_type" in self.conf.datasets.models[dataset]:
+            self.interp_type = self.conf.datasets.models[dataset].interp_type #can be 'nearest' or 'linear'
+        else:
+            self.interp_type = "nearest"
         self.read()
 
     def nemo(self):
@@ -34,6 +39,15 @@ class Reader():
         self.run(lon,lat,hs)
 
     def run(self,lon,lat,hs):
+        if self.interp_type == 'nearest':
+            self._run_nearest_neighbor(lon, lat, hs)
+        elif self.interp_type == 'linear':
+            self._run_linear_interp(lon, lat, hs)
+        else:
+            raise ValueError(f'interpolation type not known: {self.interp_type}')
+        return self
+
+    def _run_nearest_neighbor(self, lon, lat, hs):
         print('building kdtree')
 
         tree = KDTree(np.array((lon,lat)).T)
@@ -50,6 +64,18 @@ class Reader():
         self.idxs=idxs
         print (self.model_hs.shape)
         return self
+        
+    def _run_linear_interp(self, lon, lat, hs):
+        print('building linear interpolator')
+        
+        points = np.array((lon,lat)).T # shape (N, 2)
+        self.model_hs = []
+        for data in hs:
+            interp = LinearNDInterpolator(points, data)
+            self.model_hs.append(interp(self.sat_points))
+        self.model_hs = np.array(self.model_hs)
+        print (self.model_hs.shape)
+    
 
     def read(self):
         tp=self.conf.datasets.models[self.dataset].type
@@ -109,12 +135,53 @@ def getSeries(model,sat,conf,conf_sat,dataset,satname,outname):
     sat.to_netcdf('%s' % outname)
     print ('%s saved' % outname)
     return sat
+def datetime64_to_timestamp(dt64):
+    return (dt64 - np.datetime64("1970-01-01T00:00:00Z")) / np.timedelta64(1, 's')
 
-def preprocesser(ds):
+def getSeriesLinear(model,sat,conf,conf_sat,dataset,satname,outname):
+    """Linearly interpolates the model output into the satellite observation point, first in space, then in time."""
+    #define limited time from model and satellite
+    first_time = model.time.min()
+    last_time = model.time.max()
+    sat=sat.sel(obs=(sat.time>=first_time)&(sat.time<=last_time))
+    #model = model.sel(time=(model.time>=first_time)&(model.time<=last_time))
+    print('get filtered time')
+
+    sat_idxs = np.array(get_satXYT(sat, conf_sat))
     try:
-        ds[['hs', 'time', 'node', 'longitude', 'latitude', 'tri']]
+        sat_points = np.array((sat_idxs[:, 0], sat_idxs[:, 1])).T
     except:
-        ds[['hs', 'time', 'longitude', 'latitude']]
+        return
+    print(np.array(sat_idxs).shape)
+    data=Reader(conf,model,dataset,sat_points)
+    print ('model input',data.model_hs.shape)
+    print('slicing in time')
+    #print ('time idx',time_idxs.shape)
+    #print ('time filtered',time_filt.shape)
+    #print ('distance mask',data.mask_dist.shape)
+    print(sat['model_hs'].values.shape)
+    sat_tstmps = datetime64_to_timestamp(sat.time.values)
+    model_tstmps = datetime64_to_timestamp(model.time.values)
+    model_hs = []
+    for iobs in range(data.model_hs.shape[1]): # iterate over number of observations
+        time_interp = interp1d(model_tstmps, data.model_hs[:,iobs])
+        model_hs.append(time_interp(sat_tstmps[iobs]))
+    model_hs = np.array(model_hs)
+    print ('model',model_hs.shape)
+    #print('slicing sat')
+    sat=sat.sel(model=[dataset])
+    print('replacing')
+    sat['model_hs'].values=np.array([model_hs]).T
+    sat['hs'].attrs['satellite_file'] = satname
+
+    sat.to_netcdf('%s' % outname)
+    print ('%s saved' % outname)
+    return sat
+def preprocesser(ds, varnames):
+    try:
+        ds = ds[[varnames.hs, varnames.time, 'node', varnames.lon, varnames.lat, 'tri']]
+    except:
+        ds = ds[[varnames.hs, varnames.time, 'node', varnames.lon, varnames.lat]]
     return ds
 
 def submit(conf_path,start_date,end_date):
@@ -144,11 +211,17 @@ def submit(conf_path,start_date,end_date):
                         print (f'processing {dataset}')
                         filledPath=(conf_model.datasets.models[dataset].path).format(experiment=dataset,day=day)
                         print ('searching for ', filledPath)
+                        varnames = conf_model.datasets.models[dataset]
                         try:
-                            ds = preprocesser(xr.open_dataset(filledPath))
-                            daily_ds = getSeries(ds, sat, conf_model,conf_sat, dataset, os.path.basename(sat_path), outname_day)
+                            ds = preprocesser(xr.open_dataset(filledPath), varnames)
+                            if "interp_type" not in conf_model.datasets.models[dataset] or conf_model.datasets.models[dataset].interp_type == 'nearest':
+                                daily_ds = getSeries(ds, sat, conf_model,conf_sat, dataset, os.path.basename(sat_path), outname_day)
+                            elif conf_model.datasets.models[dataset].interp_type == 'linear':
+                                print('interp type is linear')
+                                daily_ds = getSeriesLinear(ds, sat, conf_model,conf_sat, dataset, os.path.basename(sat_path), outname_day)
+
                             if daily_ds:
-                                buffer.append(daily_ds)
+                             buffer.append(daily_ds)
                         except:
                             print (f'{outname_day} not available')
                             pass
