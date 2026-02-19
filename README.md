@@ -116,15 +116,45 @@ plot:
 
 ### 2. Run the Complete Workflow
 
+#### Satellite Validation (Default)
+
 ```bash
-# Submit complete workflow
-python main.py -c conf.yaml
+# Submit complete satellite validation workflow
+python main.py -c conf.yaml -s 20230101 -e 20230131
 
 # Or run individual steps
 python sat_preprocessing.py -c conf.yaml
 python mergeSats.py -c conf.yaml
 python model_preprocessingUnstruct.py -c conf.yaml
 python validation.py -c conf.yaml
+```
+
+#### Buoy Validation (NEW)
+
+```bash
+# Run buoy validation workflow
+python main.py --use-buoy -s 20210101 -e 20210131
+
+# Arguments:
+# --use-buoy : Use buoy data instead of satellite observations
+# -s YYYYMMDD : Start date
+# -e YYYYMMDD : End date
+# -c conf.yaml : Configuration file (optional)
+```
+
+**Buoy Data Sources Supported:**
+- **CSV files** - CMEMS or custom CSV format
+- **Copernicus Marine Service API** - Direct API access
+- **ISPRA folder structure** - Station folders with monthly CSV files
+- **Nausicaa single file** - Consolidated multi-year observations
+
+**Multi-source Processing:**
+Process multiple buoy sources in a single run by configuring `sources` in conf.yaml:
+
+```yaml
+buoy_preproc:
+  input:
+    sources: ['csv', 'ispra_folders', 'copernicusmarine']  # Process all at once
 ```
 
 ### 3. View Results
@@ -139,7 +169,82 @@ Generated plots will be saved to your configured output directory:
 
 ## 📚 Module Documentation
 
-### 1. `stats.py` - Statistical Metrics Module
+### 1. `buoy_preprocessing.py` - Buoy Data Preprocessing (NEW)
+
+Process buoy observations into model-compatible NetCDF format with support for multiple data sources.
+
+#### Features
+
+- **Multi-source support**: CSV files, Copernicus Marine API, ISPRA folders, Nausicaa
+- **Parallel processing**: Process multiple sources in a single run
+- **Quality control**: Variable-specific QC flags, geographic filtering, minimum observation thresholds
+- **Multiple variables**: Significant wave height, period, direction
+- **Timezone handling**: Automatic detection and conversion to UTC naive
+- **Station-based organization**: Per-station NetCDF files + merged series file
+- **Model compatibility**: Output format matches satellite preprocessing for unified validation workflow
+
+#### Supported Data Sources
+
+**1. CSV Files (CMEMS format)**
+```yaml
+buoy_preproc:
+  input:
+    sources: ['csv']
+    path: '/path/to/cmems_buoy_data.csv'
+  columns:
+    time: 'TIME'
+    lon: 'LONGITUDE'
+    lat: 'LATITUDE'
+    hs: 'VHM0'
+    station: 'PLATFORM_CODE'
+```
+
+**2. Copernicus Marine Service API**
+```yaml
+buoy_preproc:
+  input:
+    sources: ['copernicusmarine']
+    copernicusmarine:
+      dataset_id: 'cmems_obs-ins_glo_wav_my_na_irr'
+      variables: ['VHM0', 'VMDR', 'VTM10']
+```
+
+**3. ISPRA Folder Structure + Nausicaa**
+```yaml
+buoy_preproc:
+  input:
+    sources: ['ispra_folders']
+    ispra_folders:
+      base_path: '/path/to/ispra_buoys'
+      nausicaa:
+        enabled: true
+        file_path: '/path/to/nausicaa_2007_2023.txt'
+        position: [41.85, 17.18]
+      station_positions:
+        alghero: [40.548611, 8.106944]
+        # ... more stations
+```
+
+**4. Multi-source Processing**
+```yaml
+buoy_preproc:
+  input:
+    sources: ['csv', 'ispra_folders']  # Process multiple sources!
+```
+
+#### Usage
+
+```python
+from buoy_preprocessing import submit as buoy_preproc
+
+ds = buoy_preproc(conf_path='conf.yaml', start_date='20210101', end_date='20210131')
+```
+
+Output: Per-station folders + combined series file ready for model_preprocessing.
+
+---
+
+### 2. `stats.py` - Statistical Metrics Module
 
 Comprehensive statistical functions for model validation.
 
