@@ -7,6 +7,7 @@ from glob import glob
 from natsort import natsorted
 
 from utils import getConfigurationByID, daysBetweenDates
+from io_utils import open_dataset_flexible, save_dataset_flexible
 
 
 def _find_wave_height_column(df, preferred_col=None):
@@ -93,12 +94,10 @@ def build_obs_dataset(df, model_names, conf_cols, conf_vars=None):
 
     data_vars = dict(
         time=("obs", df[conf_cols.time].to_numpy(dtype="datetime64[ns]")),
-        lon=("obs", df[conf_cols.lon].to_numpy(dtype=np.float64)),
-        lat=("obs", df[conf_cols.lat].to_numpy(dtype=np.float64)),
+        longitude=("obs", df[conf_cols.lon].to_numpy(dtype=np.float64)),
+        latitude=("obs", df[conf_cols.lat].to_numpy(dtype=np.float64)),
         hs=("obs", df[conf_cols.hs].to_numpy(dtype=np.float32)),
         station=("obs", df[conf_cols.station].astype(str).to_numpy(dtype=object)),
-        model_hs=(("obs", "model"),
-                  np.full((nobs, len(model_names)), np.nan, dtype=np.float32)),
     )
     
     # Add additional variables if configured
@@ -109,9 +108,6 @@ def build_obs_dataset(df, model_names, conf_cols, conf_vars=None):
             col_name = var_conf.column
             if col_name in df.columns:
                 data_vars[var_name] = ("obs", df[col_name].to_numpy(dtype=np.float32))
-                # Add placeholder for model predictions
-                data_vars[f"model_{var_name}"] = (("obs", "model"),
-                                                     np.full((nobs, len(model_names)), np.nan, dtype=np.float32))
 
     ds = xr.Dataset(
         data_vars=data_vars,
@@ -136,7 +132,7 @@ def build_obs_dataset(df, model_names, conf_cols, conf_vars=None):
 
 def read_from_copernicusmarine(conf_buoy, start_date, end_date):
     """
-    Read buoy data from Copernicus Marine Service API.
+    Read buoy data from Copernicus Marine Service API with optional caching.
     
     Parameters
     ----------
@@ -166,6 +162,25 @@ def read_from_copernicusmarine(conf_buoy, start_date, end_date):
     # Get bounding box from filters
     lon_min, lon_max = conf_buoy.filters.valid_lon_range
     lat_min, lat_max = conf_buoy.filters.valid_lat_range
+    
+    # Check for cache file (optional)
+    cache_enabled = getattr(cm_conf, 'cache_enabled', False)
+    cache_dir = getattr(cm_conf, 'cache_dir', None)
+    
+    cache_file = None
+    if cache_enabled and cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(
+            cache_dir,
+            f"copernicusmarine_{cm_conf.dataset_id}_{start_date}_{end_date}.csv"
+        )
+        
+        if os.path.exists(cache_file):
+            print(f"Loading cached Copernicus Marine data...")
+            print(f"  Cache file: {cache_file}")
+            df = pd.read_csv(cache_file, parse_dates=['time'])
+            print(f"  Loaded {len(df)} observations from cache")
+            return df
     
     print("Fetching data from Copernicus Marine Service...")
     print(f"  Dataset: {cm_conf.dataset_id}")
@@ -216,6 +231,11 @@ def read_from_copernicusmarine(conf_buoy, start_date, end_date):
         
         df = df_wide
         print(f"  Pivoted to wide format with columns: {list(df.columns)}")
+    
+    # Save to cache if enabled
+    if cache_file:
+        df.to_csv(cache_file, index=False)
+        print(f"  Cached to: {cache_file}")
     
     return df
 
@@ -432,6 +452,7 @@ def submit(conf_path, start_date, end_date):
     """
     conf_buoy = getConfigurationByID(conf_path, "buoy_preproc")
     conf_model = getConfigurationByID(conf_path, "model_preproc")
+    conf_vars = getattr(conf_buoy, 'variables', None)
     
     date = f"{start_date}_{end_date}"
     outdir = conf_model.out_dir.out_dir
@@ -457,7 +478,7 @@ def submit(conf_path, start_date, end_date):
         if file_age_hours < 1:  # Less than 1 hour old
             print(f"\nCombined series file is recent (< 1 hour old), using existing: {outname_series}")
             # Load into memory and close file handle
-            ds = xr.open_dataset(outname_series)
+            ds = open_dataset_flexible(outname_series)
             ds_copy = ds.load()
             ds.close()
             return ds_copy
@@ -482,14 +503,16 @@ def submit(conf_path, start_date, end_date):
         
         if len(existing_source_dirs) > 0:
             print(f"Found {len(existing_source_dirs)} existing station directories for source '{source}'")
-            # Collect existing station files
+            # Collect existing station files (variable-specific files)
+            source_station_files = []
             for station_dir_name in existing_source_dirs:
-                station_file = os.path.join(outdir, station_dir_name, f"{station_dir_name}_{date}.nc")
-                if os.path.exists(station_file):
-                    all_station_files.append(station_file)
+                station_dir = os.path.join(outdir, station_dir_name)
+                var_files = glob(os.path.join(station_dir, f"{station_dir_name}_{date}_*.nc"))
+                source_station_files.extend(var_files)
             
-            if len(all_station_files) > 0:
-                print(f"Using {len(all_station_files)} existing station files, skipping data download")
+            if len(source_station_files) > 0:
+                print(f"Using {len(source_station_files)} existing station files, skipping data download")
+                all_station_files.extend(source_station_files)
                 continue
         
         # Read data from source (only if needed)
@@ -526,42 +549,114 @@ def submit(conf_path, start_date, end_date):
     if len(all_station_files) == 0:
         raise RuntimeError("No station files were created from any source.")
     
-    outname_series = os.path.join(outdir, f"{date}_buoy_series.nc")
+    # Get list of variables to process (hs + any configured variables)
+    variables_to_process = ['hs']
+    if conf_vars is not None:
+        # Add additional variables, excluding 'hs' which is already included
+        additional_vars = [var for var in conf_vars.keys() if var != 'hs']
+        variables_to_process.extend(additional_vars)
     
-    if not os.path.exists(outname_series):
-        print(f"\n{'='*60}")
-        print(f"Creating combined series file from all sources...")
-        print(f"{'='*60}")
-        print(f"Merging {len(all_station_files)} station files from {len(sources)} source(s)...")
+    # Create separate files for each variable
+    print(f"\n{'='*60}")
+    print(f"Creating separate series files for each variable...")
+    print(f"{'='*60}")
+    print(f"Variables: {variables_to_process}")
+    print(f"Merging {len(all_station_files)} station files from {len(sources)} source(s)...\n")
+    
+    output_format = getattr(conf_buoy, 'output_format', 'netcdf') if hasattr(conf_buoy, 'output_format') else 'netcdf'
+    
+    for var_idx, variable in enumerate(variables_to_process, 1):
+        outname_var = os.path.join(outdir, f"{date}_buoy_series_{variable}.nc")
         
-        # Open and concatenate all station files
-        ds_merged = xr.open_dataset(all_station_files[0])
-        obs = np.arange(len(ds_merged.obs.values))
+        # Check for variable-specific file, or fallback to all-variables file if only hs
+        if os.path.exists(outname_var):
+            print(f"  [{var_idx}/{len(variables_to_process)}] Using existing: {os.path.basename(outname_var)}")
+            continue
         
-        for f in all_station_files[1:]:
-            ds = xr.open_dataset(f)
-            obs = np.arange(len(ds.obs.values)) + (obs[-1] + 1)
-            ds = ds.assign_coords(obs=obs)
-            ds_merged = xr.concat([ds_merged, ds], "obs")
+        # Fallback: if processing hs and old all-variables file exists, use it
+        if variable == 'hs':
+            outname_fallback = os.path.join(outdir, f"{date}_buoy_series.nc")
+            if os.path.exists(outname_fallback):
+                print(f"  [{var_idx}/{len(variables_to_process)}] Found legacy all-variables file, extracting hs...")
+                ds_legacy = open_dataset_flexible(outname_fallback)
+                if 'hs' in ds_legacy.data_vars and 'model_hs' in ds_legacy.data_vars:
+                    # Extract just hs and model_hs from legacy file
+                    ds_hs_only = ds_legacy[['time', 'longitude', 'latitude', 'station', 'hs', 'model_hs']]
+                    save_dataset_flexible(ds_hs_only, outname_var, format=output_format)
+                    print(f"  [{var_idx}/{len(variables_to_process)}] Saved as: {os.path.basename(outname_var)}")
+                    continue
         
-        # Reset obs coordinate
-        ds_merged = ds_merged.assign_coords(obs=np.arange(len(ds_merged.obs)))
-        ds_merged.to_netcdf(outname_series)
-        print(f"\nSaved combined buoy series file: {outname_series}")
-        print(f"Total observations: {len(ds_merged.obs)} from {len(all_station_files)} stations")
-    else:
-        # Load into memory and close file handle
-        ds = xr.open_dataset(outname_series)
-        ds_merged = ds.load()
-        ds.close()
-        print(f"Using existing combined series file: {outname_series}")
-
-    return ds_merged
+        print(f"  [{var_idx}/{len(variables_to_process)}] Creating {os.path.basename(outname_var)}")
+        
+        # Filter to only station files for this variable
+        variable_station_files = [f for f in all_station_files if f.endswith(f"_{variable}.nc")]
+        
+        if len(variable_station_files) == 0:
+            print(f"    ✗ No station files found for variable '{variable}'")
+            continue
+        
+        # Open and concatenate station files for this variable
+        ds_list = []
+        obs_offset = 0
+        for f in variable_station_files:
+            ds = open_dataset_flexible(f)
+            
+            # Verify all required variables exist
+            required = ['time', 'longitude', 'latitude', 'station', variable]
+            missing = [v for v in required if v not in ds.data_vars and v not in ds.coords]
+            
+            if missing:
+                print(f"    Warning: Missing {missing} in {os.path.basename(f)}, skipping")
+                continue
+            
+            # Keep only required variables and drop obs coordinate
+            ds_subset = ds[required].drop_vars('obs', errors='ignore')
+            ds_list.append(ds_subset)
+        
+        if len(ds_list) > 0:
+            # Concatenate all datasets along obs dimension (will create a new obs dim automatically)
+            ds_var = xr.concat(ds_list, dim='obs')
+            
+            # Replace obs coordinate with clean int64 array
+            obs_coord = np.arange(len(ds_var.obs), dtype=np.int64)
+            ds_var = ds_var.assign_coords(obs=obs_coord)
+            
+            # Fix station variable: ensure it's string dtype, not object with mixed types
+            if 'station' in ds_var.data_vars:
+                station_values = ds_var['station'].values
+                # Convert to string array
+                ds_var['station'] = ('obs', np.asarray(station_values, dtype=str))
+            
+            # Clear all encoding to avoid rint issues during save
+            for var in ds_var.data_vars:
+                ds_var[var].encoding = {}
+            for coord in ds_var.coords:
+                ds_var[coord].encoding = {}
+            
+            save_dataset_flexible(ds_var, outname_var, format=output_format)
+            print(f"      ✓ Saved: {len(ds_var.obs)} observations")
+        else:
+            print(f"    ✗ ERROR: Could not create file for variable '{variable}'")
+    
+    print(f"\n{'='*60}")
+    print(f"✓ Separate files created for each variable:")
+    for variable in variables_to_process:
+        outname_var = os.path.join(outdir, f"{date}_buoy_series_{variable}.nc")
+        if os.path.exists(outname_var):
+            print(f"  ✓ {variable}: {outname_var}")
+    print(f"{'='*60}\n")
+    
+    # Return first variable file
+    first_var = variables_to_process[0]
+    outname_var = os.path.join(outdir, f"{date}_buoy_series_{first_var}.nc")
+    return open_dataset_flexible(outname_var)
 
 
 def process_single_source(df, cols, conf_buoy, model_names, outdir, date, source, start_date, end_date):
     """
     Process a single data source and create per-station files.
+    
+    Creates separate files for each variable to avoid reprocessing when adding new variables.
     
     Parameters
     ----------
@@ -587,9 +682,16 @@ def process_single_source(df, cols, conf_buoy, model_names, outdir, date, source
     Returns
     -------
     list
-        List of paths to created station files
+        List of paths to created station files (returns all variable files for each station)
     """
     conf_vars = getattr(conf_buoy, 'variables', None)
+    
+    # Define variables to process (hs + any configured variables)
+    variables_to_process = ['hs']
+    if conf_vars is not None:
+        # Add additional variables, excluding 'hs' which is already included
+        additional_vars = [var for var in conf_vars.keys() if var != 'hs']
+        variables_to_process.extend(additional_vars)
 
     # --- Check if data is in long format and pivot to wide format ---
     if 'variable' in df.columns and 'value' in df.columns:
@@ -655,11 +757,11 @@ def process_single_source(df, cols, conf_buoy, model_names, outdir, date, source
 
     # --- Find wave height column (handle different variable names) ---
     try:
-        actual_hs_col = _find_wave_height_column(df, preferred_col=cols.hs if hasattr(cols, 'hs') else None)
-        if actual_hs_col != cols.hs:
-            print(f"  Using '{actual_hs_col}' for wave height (configured: '{cols.hs}')")
-            # Update cols reference
-            cols.hs = actual_hs_col
+        preferred_hs = getattr(cols, 'hs', None)
+        actual_hs_col = _find_wave_height_column(df, preferred_col=preferred_hs)
+        if preferred_hs and actual_hs_col != preferred_hs:
+            print(f"  Using '{actual_hs_col}' for wave height (configured: '{preferred_hs}')")
+        cols.hs = actual_hs_col  # Store for later use (create if needed)
     except ValueError as e:
         print(f"  ERROR: {e}")
         return []
@@ -686,6 +788,25 @@ def process_single_source(df, cols, conf_buoy, model_names, outdir, date, source
     lat_min, lat_max = conf_buoy.filters.valid_lat_range
     df = df[(df[cols.lon] >= lon_min) & (df[cols.lon] <= lon_max)]
     df = df[(df[cols.lat] >= lat_min) & (df[cols.lat] <= lat_max)]
+    
+    # --- Exclude specific regions (e.g., Gulf of Biscay) ---
+    if hasattr(conf_buoy.filters, 'exclude_regions') and conf_buoy.filters.exclude_regions:
+        for region in conf_buoy.filters.exclude_regions:
+            region_name = region.get('name', 'unnamed')
+            ex_lon_min, ex_lon_max = region['lon_range']
+            ex_lat_min, ex_lat_max = region['lat_range']
+            
+            # Create mask for points INSIDE the exclusion region
+            in_exclusion = (
+                (df[cols.lon] >= ex_lon_min) & (df[cols.lon] <= ex_lon_max) &
+                (df[cols.lat] >= ex_lat_min) & (df[cols.lat] <= ex_lat_max)
+            )
+            
+            excluded_count = in_exclusion.sum()
+            if excluded_count > 0:
+                print(f"  Excluding {excluded_count} observations from '{region_name}' "
+                      f"(lon: [{ex_lon_min}, {ex_lon_max}], lat: [{ex_lat_min}, {ex_lat_max}])")
+                df = df[~in_exclusion]
 
     # --- QC filter (variable-specific if variables are configured) ---
     if conf_buoy.qc.enabled:
@@ -738,68 +859,61 @@ def process_single_source(df, cols, conf_buoy, model_names, outdir, date, source
         # Create per-station directory with source prefix
         station_dir_name = f"{source}_{station_name}"
         station_dir = os.path.join(outdir, station_dir_name)
-        outname_station = os.path.join(station_dir, f"{station_dir_name}_{date}.nc")
-        
-        # Check if file already exists before processing
-        if os.path.exists(outname_station):
-            processed_stations.append(outname_station)
-            continue
-        
-        # Only process if file doesn't exist
         os.makedirs(station_dir, exist_ok=True)
         
         # Sort by time
         station_df = station_df.sort_values(cols.time).reset_index(drop=True)
         
-        if True:  # Keep indentation level for the dataset creation code below
-            # Create dataset structure with additional variables
-            data_vars = dict(
-                time=("obs", station_df[cols.time].to_numpy(dtype="datetime64[ns]")),
-                longitude=("obs", station_df[cols.lon].to_numpy(dtype=np.float64)),
-                latitude=("obs", station_df[cols.lat].to_numpy(dtype=np.float64)),
-                hs=("obs", station_df[cols.hs].to_numpy(dtype=np.float32)),
-                station=("obs", np.full(nobs, station_id, dtype=object)),
-                model_hs=(("obs", "model"),
-                          np.full((nobs, len(model_names)), np.nan, dtype=np.float32)),
-            )
+        # Create base dataset with common variables (time, location, station)
+        common_data = {
+            'time': ("obs", station_df[cols.time].to_numpy(dtype="datetime64[ns]")),
+            'longitude': ("obs", station_df[cols.lon].to_numpy(dtype=np.float64)),
+            'latitude': ("obs", station_df[cols.lat].to_numpy(dtype=np.float64)),
+            'station': ("obs", np.full(nobs, station_id, dtype=object)),
+        }
+        
+        # Create separate files for each variable
+        for var_idx, variable in enumerate(variables_to_process):
+            outname_station_var = os.path.join(station_dir, f"{station_dir_name}_{date}_{variable}.nc")
             
-            # Add additional variables if configured
-            if conf_vars is not None:
-                for var_name, var_conf in conf_vars.items():
-                    if var_name == 'hs':  # Already added
-                        continue
-                    col_name = var_conf.column
-                    if col_name in station_df.columns:
-                        data_vars[var_name] = ("obs", station_df[col_name].to_numpy(dtype=np.float32))
-                        data_vars[f"model_{var_name}"] = (("obs", "model"),
-                                                            np.full((nobs, len(model_names)), np.nan, dtype=np.float32))
+            # Check if file already exists
+            if os.path.exists(outname_station_var):
+                processed_stations.append(outname_station_var)
+                continue
+            
+            # Build data_vars for this variable
+            data_vars = dict(common_data)
+            
+            if variable == 'hs':
+                data_vars['hs'] = ("obs", station_df[cols.hs].to_numpy(dtype=np.float32))
+            else:
+                # Additional variable
+                if variable in conf_vars and conf_vars[variable].column in station_df.columns:
+                    data_vars[variable] = ("obs", station_df[conf_vars[variable].column].to_numpy(dtype=np.float32))
             
             ds_station = xr.Dataset(
                 data_vars=data_vars,
                 coords=dict(
                     obs=np.arange(nobs),
-                    model=np.array(model_names, dtype=object),
                 ),
             )
             
             # Add attributes
-            ds_station["hs"].attrs["units"] = "m"
+            if variable == 'hs':
+                ds_station["hs"].attrs["units"] = "m"
+            elif variable in conf_vars:
+                if hasattr(conf_vars[variable], 'units'):
+                    ds_station[variable].attrs["units"] = conf_vars[variable].units
+                if hasattr(conf_vars[variable], 'long_name'):
+                    ds_station[variable].attrs["long_name"] = conf_vars[variable].long_name
+            
             ds_station.attrs["station_id"] = station_id
             ds_station.attrs["n_observations"] = nobs
             ds_station.attrs["data_source"] = source
             
-            if conf_vars is not None:
-                for var_name, var_conf in conf_vars.items():
-                    if var_name in ds_station.data_vars:
-                        if hasattr(var_conf, 'units'):
-                            ds_station[var_name].attrs["units"] = var_conf.units
-                        if hasattr(var_conf, 'long_name'):
-                            ds_station[var_name].attrs["long_name"] = var_conf.long_name
-            
             ds_station["time"].values = ds_station["time"].dt.round(freq="H")
-            ds_station.to_netcdf(outname_station)
-        
-        processed_stations.append(outname_station)
+            ds_station.to_netcdf(outname_station_var)
+            processed_stations.append(outname_station_var)
     
     # Report summary for this source
     print(f"\n=== Source '{source}' Processing Summary ===")

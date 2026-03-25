@@ -154,6 +154,52 @@ def correlation(data: np.ndarray, obs: np.ndarray) -> float:
     return np.round(np.corrcoef(data[valid_mask], obs[valid_mask])[0, 1], 4)
 
 
+def MADp(data: np.ndarray, obs: np.ndarray) -> float:
+    """
+    Mean Absolute Difference of Percentiles.
+    
+    Computes the mean absolute difference between the percentile distributions
+    of model data and observations.
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Model predictions
+    obs : np.ndarray
+        Observations (reference data)
+        
+    Returns
+    -------
+    float
+        MADp metric value rounded to 4 decimal places
+    """
+    percentiles = np.arange(0, 1.01, 0.01)
+    data_prc = np.nanquantile(data, percentiles)
+    obs_prc = np.nanquantile(obs, percentiles)
+    return np.round(np.nanmean(np.abs(data_prc - obs_prc)), 4)
+
+
+def MADc(data: np.ndarray, obs: np.ndarray) -> float:
+    """
+    Combined Mean Absolute Difference.
+    
+    Combines MADp (distribution difference) with mean absolute error.
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Model predictions
+    obs : np.ndarray
+        Observations (reference data)
+        
+    Returns
+    -------
+    float
+        MADc metric value rounded to 4 decimal places
+    """
+    return np.round(MADp(data, obs) + np.nanmean(np.abs(data - obs)), 4)
+
+
 def skill_score(data: np.ndarray, obs: np.ndarray, 
                 reference: Optional[np.ndarray] = None) -> float:
     """
@@ -358,6 +404,8 @@ def metrics(data: xr.Dataset, percentile_thresholds: Optional[list] = None) -> x
         - nrmse: Normalized RMSE
         - mae: Mean absolute error
         - nmae: Normalized MAE
+        - madp: Mean Absolute Difference of Percentiles
+        - madc: Combined Mean Absolute Difference
         - correlation: Pearson correlation coefficient
         - skill_score: Murphy's skill score
         - scatter_index: Scatter index
@@ -418,10 +466,45 @@ def metrics(data: xr.Dataset, percentile_thresholds: Optional[list] = None) -> x
     result['model_std'] = data['model_hs'].std(dim='obs')
     result['sat_std'] = data['hs'].std(dim='obs')
     
-    # Correlation and other metrics (requires special handling for xarray)
+    # MADp and MADc metrics (requires numpy arrays for percentile calculations)
     # Check if we have multiple models (extra dimensions beyond 'obs')
     model_vals = data['model_hs'].values
     obs_vals = data['hs'].values
+    
+    # Determine if we have multiple models by checking array dimensions
+    if model_vals.ndim > 1 and obs_vals.ndim == 1:
+        # Multi-model case
+        n_models = model_vals.shape[0] if model_vals.shape[0] != len(obs_vals) else model_vals.shape[1]
+        
+        madp_vals = np.full(n_models, np.nan)
+        madc_vals = np.full(n_models, np.nan)
+        
+        for i in range(n_models):
+            model_i = model_vals[i, :] if model_vals.shape[0] == n_models else model_vals[:, i]
+            valid_mask = ~(np.isnan(model_i) | np.isnan(obs_vals))
+            
+            if np.sum(valid_mask) > 1:
+                madp_vals[i] = MADp(model_i[valid_mask], obs_vals[valid_mask])
+                madc_vals[i] = MADc(model_i[valid_mask], obs_vals[valid_mask])
+        
+        if 'model' in data.dims:
+            result['madp'] = (['model'], madp_vals)
+            result['madc'] = (['model'], madc_vals)
+        else:
+            result['madp'] = madp_vals
+            result['madc'] = madc_vals
+    else:
+        # Single model case
+        valid_mask = ~(np.isnan(model_vals) | np.isnan(obs_vals))
+        if np.sum(valid_mask) > 1:
+            result['madp'] = MADp(model_vals[valid_mask], obs_vals[valid_mask])
+            result['madc'] = MADc(model_vals[valid_mask], obs_vals[valid_mask])
+        else:
+            result['madp'] = np.nan
+            result['madc'] = np.nan
+    
+    # Correlation and other metrics (requires special handling for xarray)
+    # We already extracted model_vals and obs_vals above
     
     # Determine if we have multiple models by checking array dimensions
     if model_vals.ndim > 1 and obs_vals.ndim == 1:

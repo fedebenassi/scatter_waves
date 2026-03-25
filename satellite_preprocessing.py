@@ -191,7 +191,12 @@ class Sat_processer:
             landPoints = getLand(ds[self.filters.land_masking.variable_name], self.filters.land_masking.value)
             ds[self.hs].data[landPoints] = np.nan
         
-        ds=ds[[self.hs,time,lon,lat]]
+        # Add satellite identifier before selecting variables
+        ds['satellite'] = (time, np.full(ds.sizes[time], sat_name, dtype=object))
+        
+        # Select only needed variables
+        ds=ds[[self.hs,time,lon,lat,'satellite']]
+        
         saveNc(ds, outname)
         print(f"    ✓ Saved masked file: {os.path.basename(outname)}")
 
@@ -254,9 +259,16 @@ class Sat_processer:
             print(f"\n  Standardizing variable names...")
             mrgd = mrgd.rename({self.conf.sat_specifics.lon: 'longitude', self.conf.sat_specifics.lat: 'latitude',
                                 self.conf.sat_specifics.hs: 'hs', self.conf.sat_specifics.time: 'time'})
+            
+            # Keep satellite identifier if it exists
+            if 'satellite' not in mrgd.data_vars and 'satellite' not in mrgd.coords:
+                print("  ⚠ Warning: 'satellite' variable not found in data")
+            
+            # Create model_hs with only (obs, model) dimensions
+            nobs = len(mrgd.obs)
+            nmodels = len(self.conf_model.datasets.models.keys())
             mrgd.coords['model'] = np.array(list(self.conf_model.datasets.models.keys()), dtype=str)
-            model_variable = np.zeros_like(mrgd['hs'], shape=tuple(mrgd.sizes.values()))
-            mrgd['model_hs'] = xr.DataArray(model_variable, dims=mrgd.sizes.keys())
+            mrgd['model_hs'] = (('obs', 'model'), np.full((nobs, nmodels), np.nan, dtype=np.float32))
             mrgd['time'].values = mrgd['time'].dt.round(freq='H')
             
             print(f"  Saving merged file: {os.path.basename(outname_merged)}")

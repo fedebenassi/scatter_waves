@@ -63,6 +63,7 @@ dependencies:
   - munch
   - basemap
   - netCDF4
+  - zarr  # Optional: for reading model data in Zarr format
 ```
 
 ---
@@ -95,7 +96,7 @@ model_preproc:
     models:
       my_experiment:
         type: 'unstructured'
-        path: '/path/to/model/ww3*.nc'
+        path: '/path/to/model/ww3*.nc'  # Supports .nc, .zarr, or wildcard patterns
         lat: 'latitude'
         lon: 'longitude'
         hs: 'hs'
@@ -464,12 +465,14 @@ print(f"Overall RMSE: {all_metrics['RMSE']:.3f}")
 print(f"P95 RMSE: {all_metrics['RMSE_P95']:.3f}")  # RMSE for extreme events (>95th percentile)
 ```
 
-#### Available Metrics (52 total)
+#### Available Metrics (54 total)
 
-**Standard Metrics (11):**
+**Standard Metrics (13):**
 - `BIAS` - Mean bias (model - obs)
 - `RMSE` - Root Mean Square Error
 - `MAE` - Mean Absolute Error
+- `MADp` - Mean Absolute Difference of Percentiles (NEW)
+- `MADc` - Combined Mean Absolute Difference (NEW)
 - `NRMSE` - Normalized RMSE
 - `NMAE` - Normalized MAE
 - `NBIAS` - Normalized Bias
@@ -648,6 +651,32 @@ plotTracks(
 ---
 
 ## 🎯 Advanced Features
+
+### Zarr Format Support for Model Inputs (NEW)
+
+The toolkit now supports reading model data from Zarr format in addition to NetCDF:
+
+```yaml
+model_preproc:
+  datasets:
+    models:
+      my_model_netcdf:
+        path: '/path/to/model/ww3.{day}.nc'  # NetCDF files
+        
+      my_model_zarr:
+        path: '/path/to/model/ww3_{day}.zarr'  # Zarr stores
+        
+      my_model_multi_zarr:
+        path: '/path/to/model/ww3_*.zarr'  # Multiple Zarr stores (concatenated)
+```
+
+**Benefits of Zarr:**
+- Faster parallel I/O for large datasets
+- Cloud-optimized storage (S3, GCS, Azure)
+- Efficient chunked access for subsetting
+- Better compression ratios
+
+**Note:** Zarr support is for **model input data only**. All outputs remain in NetCDF format for maximum compatibility.
 
 ### Extreme Event Validation
 
