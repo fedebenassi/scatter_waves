@@ -1,0 +1,190 @@
+sat_preproc:
+  sat_names: ['CFOSAT','Cryosat-2','Saral-AltiKa','Jason-1', 'Jason-2', 'Jason-3','Envisat']
+  sat_specifics:
+    lat: 'latitude'
+    lon: 'longitude'
+    time: 'time'
+    hs: 'VAVH'
+    type: 'L3'
+  paths: &out
+    sat: '/users_home/cmcc/fb10724/wavegraph_validation/data/satellite_complete/{satName}/{year}/{month}/'
+    out_dir: '/work/cmcc/fb10724/wavegraph_validation/data/long_val_sat_buoys'
+  filenames:
+    sat:
+      template: 'global_vavh_l3_rep_*{day}*.nc'
+      cicle: '*'
+      passage: '*'
+    output: '{sat_name}_{day}'
+  processing:
+    boundingBox:
+      xmin: -5
+      xmax: 36.5
+      ymin: 30.4
+      ymax: 46.5
+    filters:
+      quality_check:
+         variable_name: False  #qual_alt_1hz_swh_ku  ## Set to False to skip, else set the variable name
+         value: 0                                         # set the idenfifier for good data
+      land_masking:
+        variable_name: False #'surface_type' ## Set to False to skip, else set the variable name
+        value: 0              
+        shapefile: # set the idenfifier for the ocean
+      zscore:
+        sigma: 3 
+
+buoy_preproc:
+  input:
+    sources: ['copernicusmarine', 'ispra_folders']  # List of sources to process: 'csv', 'copernicusmarine', 'ispra_folders'
+    # To process multiple sources in one run, use: sources: ['csv', 'ispra_folders', 'copernicusmarine']
+    # path: '/work/cmcc/fb10724/wavegraph_validation/data/cmems_buoys/cmems_obs-ins_glo_wav_my_na_PT1H_VAVH-VGHS-VHM0-VGTA-VTZA-VTM10-VDIR-VMDR_6.00W-36.00E_30.00N-46.00N_0.00m_2021-01-01-2024-12-31.csv'
+    # Copernicusmarine API settings (used when source='copernicusmarine')
+    copernicusmarine:
+      dataset_id: 'cmems_obs-ins_glo_wav_my_na_PT1H' # hourly dataset
+      dataset_part: 'history'
+      variables: ['VGHS', 'VAVH', 'VHM0', 'WDIR', 'VGTA', 'VTZA', 'VTM10', 'VTM02', 'VDIR', 'VMDR', 'VPSP']
+      minimum_depth: 0
+      maximum_depth: 0
+      cache_enabled: True
+      cache_dir: '/work/cmcc/fb10724/wavegraph_validation/data/cached_copernicusmarine'
+    # ISPRA folders settings (used when source='ispra_folders')
+    ispra_folders:
+      base_path: '/work/cmcc/fb10724/wavegraph_validation/data/ispra_buoys'
+      file_pattern: '{station}_wave_*.csv'  # Pattern for monthly files
+      delimiter: ';'
+      time_format: '%Y-%m-%d %H:%M:%S'  # For files with UTC column
+      # Column mappings for ISPRA format
+      columns:
+        time: 'UTC'  # or use aaaa,mm,dd,HH,MM for nausicaa format
+        hs: 'Hm0'    # or 'SWH' for nausicaa format
+        dir: 'Dir'
+        tm: 'Tm'
+        tp: 'Tp'
+      # Nausicaa single-file configuration
+      nausicaa:
+        enabled: true
+        file_path: '/work/cmcc/fb10724/wavegraph_validation/data/ispra_buoys/nausicaa_2007_2023.txt'
+        position: [44.225, 12.475]  # [lat, lon] for Nausicaa buoy
+      # Station positions (lat, lon) - add your stations here
+      station_positions:
+        alghero: [40.548611, 8.106944]
+        ancona: [43.823889, 13.719444]
+        cagliari: [39.115, 9.405]
+        catania: [37.44, 15.146667]
+        cetraro: [39.453333, 15.918333]
+        civitavecchia: [42.244722, 11.553889]
+        crotone: [39.023611, 17.22]
+        la-spezia: [43.929167, 9.827778]
+        mazara-del-vallo: [37.518056, 12.533333]
+        monopoli: [40.975, 17.377778]
+        ortona: [42.406667, 14.536111]
+        palermo: [38.258333, 13.333333]
+        ponza: [40.866667, 12.95]
+        ragusa: [36.7224, 14.5239]
+        siniscola: [40.616667, 9.891667]
+        venezia: [45.333333, 12.516667]
+  columns:
+    time: 'time'
+    lon: 'longitude'
+    lat: 'latitude'
+    hs: 'VHM0'
+    station: 'platform_id'
+    qc: 'value_qc'
+  # Additional variables to include (optional)
+  variables:
+    hs:
+      column: 'VHM0'
+      qc_column: 'VHM0_QC'
+      units: 'm'
+      long_name: 'Significant wave height'
+    mwp:
+      column: 'VTM10'  # or VTM02, VGTA, VTZA
+      qc_column: 'VTM10_QC'
+      units: 's'
+      long_name: 'Mean wave period'
+    # Uncomment to include wave direction
+    # mwd:
+    #   column: 'VMDR'  # or VDIR
+    #   qc_column: 'VMDR_QC'
+    #   units: 'degree'
+    #   long_name: 'Mean wave direction'
+  time:
+    format: '%Y-%m-%dT%H:%M:%SZ'  # Set to null/False to auto-parse
+    utc: True
+  filters:
+    drop_na: True
+    valid_lon_range: [-5, 36.5]    # Main bounding box for Mediterranean
+    valid_lat_range: [30, 46.5]    # Includes full Adriatic (up to 46°N)
+    # Exclude specific regions (e.g., Gulf of Biscay)
+    exclude_regions:
+      - name: 'Gulf of Biscay'
+        lon_range: [-5, 0]      # Longitude bounds to exclude
+        lat_range: [42, 46.5]   # Latitude bounds to exclude
+      - name: 'Black Sea'
+        lon_range: [25, 30]      # Longitude bounds to exclude
+        lat_range: [40.5, 46.5]   # Latitude bounds to exclude
+    min_valid_obs: 100  # Minimum number of valid observations per day to save
+
+  qc:
+    enabled: True
+    allowed: [1, 2, 5, 8]  # Quality control values to keep
+  output:
+    merged: null  # Not used - compatibility with old code
+    per_station_dir: null  # Set to path to save per-station files
+
+model_preproc:
+  out_dir: *out
+  #variable: 'hs'  # Variable to validate: 'hs', 'tp', 'tm', 'dir', etc.
+  datasets:
+    sat:
+      path: '/work/cmcc/fb10724/wavegraph_validation/data/long_val_sat_buoys/{date}_landMasked_qcheck_ALLSAT.nc'
+    buoy:
+      path: '/work/cmcc/fb10724/wavegraph_validation/data/long_val_sat_buoys/{date}_buoy_series.nc'
+    models: # for validation of more exps please repeat the code block 'yourExp1' naming it as you prefer
+      wavegraph:
+       type: 'unstr' #available types are ['nemo', 'cf', 'unstr']
+       path: '/work/cmcc/fb10724/wavegraph_validation/models/med/256dim_1inp/wav_{day}.nc'
+       lat: 'lat'
+       lon: 'lon'
+       time: 'time'
+       interp_type: 'barycentric'
+       mesh_gr3 : '/work/cmcc/fb10724/wavegraph_validation/models/med/mesh.gr3'
+       # Variable mappings: obs_variable -> model_variable
+       variables:
+         hs: 'swh'
+         mwp: 'mwp'
+      mentaschi:
+       type: 'unstr' #available types are ['nemo', 'cf', 'unstr']
+       path: '/work/cmcc/fb10724/wavegraph_validation/models/med/mentaschi/wav_{day}.nc'
+       lat: 'lat'
+       lon: 'lon'
+       time: 'time'
+       interp_type: 'barycentric'
+       mesh_gr3 : '/work/cmcc/fb10724/wavegraph_validation/models/med/mesh.gr3'
+       # Variable mappings: obs_variable -> model_variable
+       variables:
+         hs: 'swh'
+         mwp: 'mwp'
+  filters:
+    max_distance_in_space: 0.1                         # (in degree) it discards data if sat is farther this value
+    max_distance_in_time: 1                             # (in hours) it discards data if sat is farther this value                         
+
+# plot:
+#   title: '{start_date} - {end_date}' #,Cryosat-2,AltiKa,HY-2B,Jason-3,Sentinel-3A,Sentinel-3B [m]' # this is a string in the plot title
+#   out_dir: *out #'/work/opa/sc33616/work/iride_test/sat/plots'
+#   coast_resolution: 'i'
+#   binning_resolution: 0.05
+#   experiments: # experiments you want to plot
+#     adri_2:
+#       series: '{out_dir}/{date}_series.nc'
+#     adri_st6:
+#       series: '{out_dir}/{date}_series.nc'
+#   filters:
+#     ntimes: 3 # mask data if satellite hs is > of ntimes * model hs
+#     min: 0.15 # discard Hs< min
+#     max: 20   # discard Hs> max
+#     unbias: False
+#     percentile_thresholds: [75, 90, 95]  # 
+
+
+
+
