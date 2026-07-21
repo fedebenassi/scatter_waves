@@ -1,3 +1,4 @@
+
 """
 model_preprocessing.py
 
@@ -31,6 +32,32 @@ from io_utils import open_dataset_flexible, open_mfdataset_flexible, save_datase
 # -------------------------
 
 _MESH_CACHE = {}  # gr3_path -> (x, y, tri, triang, finder, kdtree)
+_REGULAR_MODEL_TYPES = {"reg", "regular", "cf", "cf_compl", "cf_compliant"}
+_UNSTRUCTURED_MODEL_TYPES = {"u", "unstr", "unstruct", "unstructured"}
+
+
+def _as_mapping(obj):
+    """Best-effort conversion of config object/dict into a plain mapping."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "items"):
+        try:
+            return dict(obj.items())
+        except Exception:
+            pass
+    if hasattr(obj, "keys"):
+        out = {}
+        for key in obj.keys():
+            try:
+                out[key] = obj[key]
+            except Exception:
+                out[key] = getattr(obj, key)
+        return out
+    if hasattr(obj, "__dict__"):
+        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    return {}
 
 def read_gr3_mesh(gr3_path: str):
     """
@@ -99,6 +126,91 @@ def barycentric_weights(px, py, x1, y1, x2, y2, x3, y3):
     return w1, w2, w3
 
 
+def _model_type(mconf) -> str:
+    return str(mconf.type).lower()
+
+
+def _is_regular_model(mconf) -> bool:
+    return _model_type(mconf) in _REGULAR_MODEL_TYPES
+
+
+def _is_unstructured_model(mconf) -> bool:
+    return _model_type(mconf) in _UNSTRUCTURED_MODEL_TYPES
+
+
+def _resolve_model_variable(mconf, variable: str) -> str:
+    mapping = _as_mapping(getattr(mconf, "variables", None))
+    return mapping.get(variable, variable)
+
+
+def _ensure_observation_variable(ds: xr.Dataset, variable: str, mconf):
+    """Ensure canonical observation variable exists in dataset, using mapped alias if needed."""
+    if variable in ds.data_vars:
+        return variable
+
+    mapped = _resolve_model_variable(mconf, variable)
+    if mapped != variable and mapped in ds.data_vars:
+        ds[variable] = ds[mapped]
+        return variable
+
+    return None
+
+
+def _observation_mask(sat: xr.Dataset, first_time, last_time):
+    return (sat.time >= first_time) & (sat.time <= last_time)
+
+
+def _load_dataset(path: str) -> xr.Dataset:
+    return open_dataset_flexible(path)
+
+
+def _merge_variable_dataset(base: xr.Dataset | None, incoming: xr.Dataset) -> xr.Dataset:
+    if base is None:
+        return incoming
+    for name in incoming.data_vars:
+        if name not in base.data_vars:
+            base[name] = incoming[name]
+    return base
+
+
+def _model_output_path(outdir: str, date: str, dataset: str, obs_type: str) -> str:
+    if obs_type == "sat":
+        return os.path.join(outdir, f"{date}_{dataset}.nc")
+    return os.path.join(outdir, f"{date}_{dataset}_{obs_type}.nc")
+
+
+def _daily_cache_paths(outdir: str, day: str, dataset: str, obs_type: str, variables: list[str]):
+    if obs_type == "sat":
+        return [os.path.join(outdir, f"{day}_{dataset}_{obs_type}.nc")]
+    return [os.path.join(outdir, f"{day}_{dataset}_{obs_type}_{var}.nc") for var in variables]
+
+
+def _variables_to_process(conf_path: str, obs_type: str) -> list[str]:
+    variables = ['hs']
+    if obs_type != 'buoy':
+        return variables
+    conf_buoy = getConfigurationByID(conf_path, "buoy_preproc")
+    conf_vars = getattr(conf_buoy, 'variables', None)
+    variables.extend([var for var in _as_mapping(conf_vars).keys() if var != 'hs'])
+    if 'mwd' in variables:
+        variables.remove('mwd')
+        variables.extend(['mwd_sin', 'mwd_cos'])
+    return variables
+
+
+def _obs_input_file(outdir: str, date: str, obs_type: str, variable: str, conf_model, conf_sat):
+    if obs_type == 'sat':
+        return (conf_model.datasets.sat.path).format(
+            out_dir=outdir,
+            date=date,
+            sigma=conf_sat.processing.filters.zscore.sigma,
+        )
+    buoy_path_template = (conf_model.datasets.buoy.path).format(out_dir=outdir, date=date)
+    if buoy_path_template.endswith('.nc'):
+        buoy_path_template = buoy_path_template[:-3]
+    return f"{buoy_path_template}_{variable}.nc"
+
+
 # -------------------------
 # Sat/buoy observation helpers
 # -------------------------
@@ -143,13 +255,13 @@ class Reader:
 
         mconf = self.conf.datasets.models[dataset]
         self.mconf = mconf
+        self.model_type = _model_type(mconf)
 
         self.interp_type = getattr(mconf, "interp_type", "nearest")
         if self.interp_type == "auto":
-            tp = mconf.type.lower()
-            if tp in ["reg", "regular", "cf", "cf_compl", "cf_compliant"]:
+            if _is_regular_model(mconf):
                 self.interp_type = "bilinear"
-            elif tp in ["u", "unstr", "unstruct", "unstructured"]:
+            elif _is_unstructured_model(mconf):
                 self.interp_type = "barycentric"
             else:
                 self.interp_type = "nearest"
@@ -162,50 +274,36 @@ class Reader:
         self.read_and_run()
 
     def read_and_run(self):
-        tp = self.mconf.type.lower()
-
-        if tp in ["reg", "regular", "cf", "cf_compl", "cf_compliant"]:
+        if _is_regular_model(self.mconf):
             if self.interp_type == "bilinear":
                 self._run_bilinear_regular()
                 self.outputs = "values"
             else:
-                # Scattered view for regular/CF when using nearest/linear fallback
                 self._run_scattered_cf_like()
-        elif tp in ["u", "unstr", "unstruct", "unstructured"]:
+        elif _is_unstructured_model(self.mconf):
             self._run_unstructured()
         else:
             raise ValueError(f"Unknown model type '{self.mconf.type}' for dataset '{self.dataset}'")
 
     def _get_model_variable_name(self):
         """Get actual model variable name for observation variable using config mapping."""
-        if hasattr(self.mconf, 'variables') and isinstance(self.mconf.variables, dict):
-            return self.mconf.variables.get(self.variable, self.variable)
-        return self.variable
+        return _resolve_model_variable(self.mconf, self.variable)
 
     # ---- regular/CF as scattered (nearest or LinearNDInterpolator)
     def _run_scattered_cf_like(self):
         m = self.model
-        # Get actual model variable name from config using the observation variable name
         model_var = self._get_model_variable_name()
+        if model_var not in m.data_vars:
+            raise ValueError(f"Model variable '{model_var}' (mapped from obs '{self.variable}') not found in dataset '{self.dataset}'. Available: {list(m.data_vars.keys())}")
+        
         hs_da = m[model_var]
 
-        # Stack lat/lon dims to a node dim (this is what your original cf() did)
         stacked = hs_da.stack(node=(self.mconf.lat, self.mconf.lon)).dropna(dim="node")
 
-        # Try to locate lon/lat coords after stacking (depends on your dataset naming)
-        # If your stacked coords are exactly mconf.lon/mconf.lat, use those.
-        if self.mconf.lon in stacked.coords:
-            lon = stacked[self.mconf.lon].values
-        else:
-            # fallback: common names
-            lon = stacked["longitude"].values
+        lon = stacked[self.mconf.lon].values if self.mconf.lon in stacked.coords else stacked["longitude"].values
+        lat = stacked[self.mconf.lat].values if self.mconf.lat in stacked.coords else stacked["latitude"].values
 
-        if self.mconf.lat in stacked.coords:
-            lat = stacked[self.mconf.lat].values
-        else:
-            lat = stacked["latitude"].values
-
-        hs = stacked.values  # (time, node)
+        hs = stacked.values
 
         if self.interp_type == "nearest":
             self._run_nearest(lon, lat, hs)
@@ -214,18 +312,18 @@ class Reader:
             self._run_linear_scattered(lon, lat, hs)
             self.outputs = "values"
         else:
-            # If someone sets bilinear but grid isn't usable, we already routed earlier.
-            # If someone sets barycentric on a regular grid, refuse.
             raise ValueError(f"interp_type '{self.interp_type}' incompatible with regular/cf dataset '{self.dataset}'")
 
     # ---- unstructured: nodes are already 1D (node)
     def _run_unstructured(self):
         m = self.model
-        # Get actual model variable name from config using the observation variable name
         model_var = self._get_model_variable_name()
+        if model_var not in m.data_vars:
+            raise ValueError(f"Model variable '{model_var}' (mapped from obs '{self.variable}') not found in dataset '{self.dataset}'. Available: {list(m.data_vars.keys())}")
+
         lon = m[self.mconf.lon].values
         lat = m[self.mconf.lat].values
-        hs = m[model_var].values  # (time, node) expected
+        hs = m[model_var].values
 
         if self.interp_type == "nearest":
             self._run_nearest(lon, lat, hs)
@@ -253,11 +351,9 @@ class Reader:
         pts_nodes = np.column_stack([lon_nodes, lat_nodes])
         tree = cKDTree(pts_nodes)
 
-        # distance mask (keep filter semantics consistent)
         dist, _ = tree.query(self.obs_points, k=1)
         self.mask_dist = dist <= float(self.conf.filters.max_distance_in_space)
 
-        # Evaluate LinearNDInterpolator for each time step
         out = np.full((hs_time_node.shape[0], self.obs_points.shape[0]), np.nan, dtype=float)
         for it in range(hs_time_node.shape[0]):
             itp = LinearNDInterpolator(pts_nodes, hs_time_node[it, :], fill_value=np.nan)
@@ -274,25 +370,22 @@ class Reader:
         If lon/lat are not 1D, we fall back to scattered 'linear' (and keep filters).
         """
         m = self.model
-        # Get actual model variable name from config using the observation variable name
         model_var = self._get_model_variable_name()
+        if model_var not in m.data_vars:
+            raise ValueError(f"Model variable '{model_var}' (mapped from obs '{self.variable}') not found in dataset '{self.dataset}'. Available: {list(m.data_vars.keys())}")
+
         lon = m[self.mconf.lon].values
         lat = m[self.mconf.lat].values
         hs_da = m[model_var]
 
-        # If not 1D -> fallback to scattered linear (better than lying about bilinear)
         if lon.ndim != 1 or lat.ndim != 1:
             print(f"[WARN] '{self.dataset}': lon/lat not 1D; bilinear impossible. Falling back to scattered linear.")
-            # Flatten as scattered and run linear
             self.interp_type = "linear"
             self._run_scattered_cf_like()
             return
 
-        # ensure hs has dims including time, lat, lon by name
-        # (xarray will reorder with transpose)
         hs_da = hs_da.transpose(self.mconf.time, self.mconf.lat, self.mconf.lon)
 
-        # Make coordinates increasing by reversing indices (safe)
         if not np.all(np.diff(lon) > 0):
             hs_da = hs_da.isel({self.mconf.lon: slice(None, None, -1)})
             lon = lon[::-1]
@@ -300,20 +393,14 @@ class Reader:
             hs_da = hs_da.isel({self.mconf.lat: slice(None, None, -1)})
             lat = lat[::-1]
 
-        # Points for interpolation must be (lat, lon)
         pts_latlon = np.column_stack([self.obs_points[:, 1], self.obs_points[:, 0]])
 
         ntime = hs_da.sizes[self.mconf.time]
         nobs = self.obs_points.shape[0]
-        
-        # Compute data in memory once to avoid repeated I/O for each timestep
         print(f"      Loading {ntime} timesteps into memory for interpolation...")
-        hs_data = hs_da.values  # Load all data at once (ntime, nlat, nlon)
-        
-        # Pre-allocate output
+        hs_data = hs_da.values
+
         out = np.full((ntime, nobs), np.nan, dtype=np.float32)
-        
-        # Interpolate all timesteps (vectorized when possible)
         print(f"      Interpolating {nobs} points across {ntime} timesteps...")
         for it in range(ntime):
             itp = RegularGridInterpolator(
@@ -325,7 +412,6 @@ class Reader:
             )
             out[it, :] = itp(pts_latlon)
 
-        # distance filter: compute nearest gridpoint distance on full mesh (lon/lat)
         Lon, Lat = np.meshgrid(lon, lat)  # shape (nlat, nlon)
         tree = cKDTree(np.column_stack([Lon.ravel(), Lat.ravel()]))
         dist, _ = tree.query(self.obs_points, k=1)
@@ -344,11 +430,9 @@ class Reader:
 
         x, y, tri, triang, finder, kdtree = get_gr3_structures(gr3_path)
 
-        # which triangle contains each point
         t_index = finder(self.obs_points[:, 0], self.obs_points[:, 1])  # (lon,lat) == (x,y)
         inside = t_index >= 0
 
-        # distance filter (nearest node) AND inside-triangle
         dist, _ = kdtree.query(self.obs_points, k=1)
         self.mask_dist = (dist <= float(self.conf.filters.max_distance_in_space)) & inside
 
@@ -399,9 +483,6 @@ def getSeries(model: xr.Dataset, sat: xr.Dataset, conf, conf_sat, dataset: str, 
     variable : str
         Variable name to process (e.g., 'hs', 'mwp')
     """
-    # Get actual model variable name from config
-    model_var = conf.datasets.models[dataset].variables.get(variable, variable)
-    
     # limited overlap in time
     first_time = max(sat.time.min(), model.time.min())
     last_time  = min(sat.time.max(), model.time.max())
@@ -433,7 +514,11 @@ def getSeries(model: xr.Dataset, sat: xr.Dataset, conf, conf_sat, dataset: str, 
     obs_points, _ = get_obs_XYT(sat_sub, conf_sat)
     obs_points_tf = obs_points[time_filt, :]
 
-    data = Reader(conf, model_sub, dataset, obs_points_tf, variable)
+    try:
+        data = Reader(conf, model_sub, dataset, obs_points_tf, variable)
+    except ValueError as e:
+        print(f"    ✗ Skipping variable '{variable}': {e}")
+        return None
 
     if data.outputs == "indexed":
         # model_hs is (time,node); idxs is (obs_tf,)
@@ -449,9 +534,15 @@ def getSeries(model: xr.Dataset, sat: xr.Dataset, conf, conf_sat, dataset: str, 
     # Slice satellite dataset consistently: first time_filt, then spatial mask
     sat_out = sat_sub.isel(obs=time_filt).isel(obs=data.mask_dist)
 
+    # Keep canonical obs variable name even when source provides alias (e.g., mwp_vgta -> mwp)
+    _ensure_observation_variable(sat_out, variable, conf.datasets.models[dataset])
+
     # Write model predictions
     sat_out[f"model_{variable}"] = ('obs', model_vals)
-    sat_out[f"{variable}"].attrs["satellite_file"] = satname
+    
+    # Set attributes on observation variable if it exists
+    if variable in sat_out.data_vars:
+        sat_out[f"{variable}"].attrs["satellite_file"] = satname
 
     return sat_out
 
@@ -468,9 +559,6 @@ def getSeriesLinear(model: xr.Dataset, sat: xr.Dataset, conf, conf_sat, dataset:
     variable : str
         Variable name to process (e.g., 'hs', 'mwp')
     """
-    # Get actual model variable name from config
-    model_var = conf.datasets.models[dataset].variables.get(variable, variable)
-    
     # overlap in time (full model range)
     first_time = model.time.min()
     last_time  = model.time.max()
@@ -482,7 +570,11 @@ def getSeriesLinear(model: xr.Dataset, sat: xr.Dataset, conf, conf_sat, dataset:
 
     obs_points, _ = get_obs_XYT(sat_sub, conf_sat)
 
-    data = Reader(conf, model, dataset, obs_points, variable)
+    try:
+        data = Reader(conf, model, dataset, obs_points, variable)
+    except ValueError as e:
+        print(f"    ✗ Skipping variable '{variable}': {e}")
+        return None
     # data.model_hs is (time, obs) for bilinear/linear/barycentric; for nearest it's (time,node)
     # For linear-time interpolation we NEED values per-obs; if nearest, convert to per-obs first.
     if data.outputs == "indexed":
@@ -500,6 +592,9 @@ def getSeriesLinear(model: xr.Dataset, sat: xr.Dataset, conf, conf_sat, dataset:
     sat_out = sat_sub.isel(obs=mask)
     vals_per_obs = vals_per_obs[:, mask]
 
+    # Keep canonical obs variable name even when source provides alias (e.g., mwp_vgta -> mwp)
+    _ensure_observation_variable(sat_out, variable, conf.datasets.models[dataset])
+
     sat_t = datetime64_to_timestamp(sat_out.time.values)
     mod_t = datetime64_to_timestamp(model.time.values)
 
@@ -510,7 +605,10 @@ def getSeriesLinear(model: xr.Dataset, sat: xr.Dataset, conf, conf_sat, dataset:
 
     # Write model predictions
     sat_out[f"model_{variable}"] = ('obs', model_vals)
-    sat_out[f"{variable}"].attrs["satellite_file"] = satname
+    
+    # Set attributes on observation variable if it exists
+    if variable in sat_out.data_vars:
+        sat_out[f"{variable}"].attrs["satellite_file"] = satname
 
     return sat_out
 
@@ -576,37 +674,27 @@ def submit(conf_path: str, start_date: str, end_date: str, obs_type: str = 'sat'
     print(f"LOADING {obs_type.upper()} OBSERVATIONS")
     print(f"{'='*60}")
     
-    # Get configuration for variables (hs is always present, plus any additional variables)
-    # Only include additional variables for buoy data (satellite data is limited to hs)
-    variables_to_process = ['hs']
-    if obs_type == 'buoy':
-        conf_buoy = getConfigurationByID(conf_path, "buoy_preproc")
-        conf_vars = getattr(conf_buoy, 'variables', None)
-        if conf_vars is not None:
-            # Add additional variables, excluding 'hs' which is already included
-            additional_vars = [var for var in conf_vars.keys() if var != 'hs']
-            variables_to_process.extend(additional_vars)
+    variables_to_process = _variables_to_process(conf_path, obs_type)
     
-    # Load observation file(s)
+    # Load observation file(s) - keep per-variable independence for buoy data
+    sat_by_var = {}  # variable -> dataset
     if obs_type == 'buoy':
-        # Load all per-variable files and merge observation variables
+        # Load each per-variable file independently (do NOT merge to preserve independent obs counts)
         obs_files = [f"{obs_path_template}_{var}.nc" for var in variables_to_process]
         print(f"Files: {[os.path.basename(f) for f in obs_files]}")
         
-        sat = None
-        for var_file in obs_files:
+        for var in variables_to_process:
+            var_file = f"{obs_path_template}_{var}.nc"
             if os.path.exists(var_file):
-                ds_var = open_dataset_flexible(var_file)
-                if sat is None:
-                    sat = ds_var
-                else:
-                    # Merge observation variables from other files
-                    for var in ds_var.data_vars:
-                        if var not in sat.data_vars and var != f"model_{variables_to_process[0]}":
-                            sat[var] = ds_var[var]
+                sat_by_var[var] = open_dataset_flexible(var_file)
+                print(f"  Loaded {var}: {sat_by_var[var].sizes.get('obs', 0)} observations")
         
-        if sat is None:
+        if not sat_by_var:
             raise RuntimeError(f"No buoy observation files found: {obs_files}")
+        
+        # Use first variable for reference (for spatial/temporal union bounds)
+        first_var = variables_to_process[0]
+        sat = sat_by_var.get(first_var)
     else:
         obs_path = (conf_model.datasets.sat.path).format(
             out_dir=outdir,
@@ -615,18 +703,23 @@ def submit(conf_path: str, start_date: str, end_date: str, obs_type: str = 'sat'
         )
         print(f"File: {obs_path}")
         sat = open_dataset_flexible(obs_path)
+        sat_by_var[variables_to_process[0]] = sat  # Use single sat file for all variables
     
-    print(f"  Number of observations: {sat.sizes.get('obs', 0)}")
+    print(f"  Number of observations (reference): {sat.sizes.get('obs', 0)}")
     print(f"  Variables: {list(sat.data_vars.keys())}")
     
     # Check if all variable-specific output files exist and are up-to-date
     all_outputs_exist = True
     for variable in variables_to_process:
-        outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{variable}.nc")
+        outname_var = os.path.join(outdir, f"{date}_{output_suffix}.nc") if obs_type == 'sat' else os.path.join(outdir, f"{date}_{output_suffix}_{variable}.nc")
         if not os.path.exists(outname_var):
             all_outputs_exist = False
             break
-        obs_mtime = os.path.getmtime(obs_path)
+        obs_input = _obs_input_file(outdir, date, obs_type, variable, conf_model, conf_sat)
+        if not os.path.exists(obs_input):
+            all_outputs_exist = False
+            break
+        obs_mtime = os.path.getmtime(obs_input)
         out_mtime = os.path.getmtime(outname_var)
         if out_mtime <= obs_mtime:
             all_outputs_exist = False
@@ -636,7 +729,10 @@ def submit(conf_path: str, start_date: str, end_date: str, obs_type: str = 'sat'
         print(f"\n✓ All output files exist and are up-to-date")
         # Load the first variable file for return value
         first_var = variables_to_process[0]
-        outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{first_var}.nc")
+        if obs_type == 'sat':
+            outname_var = os.path.join(outdir, f"{date}_{output_suffix}.nc")
+        else:
+            outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{first_var}.nc")
         return open_dataset_flexible(outname_var)
     else:
         print(f"\n⚠ Some output files missing or outdated - reprocessing")
@@ -645,96 +741,61 @@ def submit(conf_path: str, start_date: str, end_date: str, obs_type: str = 'sat'
     print(f"PROCESSING {len(conf_model.datasets.models)} MODEL(S)")
     print(f"{'='*60}\n")
 
-    buffer_all = []
-
+    # Keep track of per-model, per-variable merged outputs
+    model_names = list(conf_model.datasets.models.keys())
+    per_model_var_paths = {var: {} for var in variables_to_process}
     for dataset_idx, dataset in enumerate(conf_model.datasets.models, 1):
         print(f"\n{'='*60}")
         print(f"MODEL {dataset_idx}/{len(conf_model.datasets.models)}: {dataset.upper()}")
         print(f"{'='*60}")
-        
-        # Check if per-model file already exists
-        outname_ds = os.path.join(outdir, f"{date}_{dataset}_{output_suffix}.nc")
-        if os.path.exists(outname_ds):
-            print(f"  ✓ Using existing dataset file: {os.path.basename(outname_ds)}")
-            ds = open_dataset_flexible(outname_ds)
-            ds_loaded = ds.load()
-            ds.close()
-            buffer_all.append(ds_loaded)
-            continue
-        
         print(f"  Processing days for {dataset}...")
-        buffer_days = []
         days_list = daysBetweenDates(start_date, end_date)
         print(f"  Date range: {start_date} to {end_date} ({len(days_list)} days)\n")
-        
+        # 1) Build missing per-day variable files by loading each day model only once
         for day_idx, day in enumerate(days_list, 1):
-            print(f"  [{day_idx}/{len(days_list)}] Processing day {day}")
-            
-            # Check for cached daily files (per-variable)
-            daily_cache_files = [os.path.join(outdir, f"{day}_{dataset}_{obs_type}_{var}.nc") for var in variables_to_process]
-            all_daily_cached = all(os.path.exists(f) for f in daily_cache_files)
-            
-            if all_daily_cached:
-                print(f"    ✓ Using cached day files (all variables)")
-                day_ds_all_vars = None
-                for var, cache_file in zip(variables_to_process, daily_cache_files):
-                    ds_var = open_dataset_flexible(cache_file)
-                    ds_loaded = ds_var.load()
-                    ds_var.close()
-                    if day_ds_all_vars is None:
-                        day_ds_all_vars = ds_loaded
-                    else:
-                        # Merge variables into same dataset
-                        for var_name in ds_loaded.data_vars:
-                            if var_name not in day_ds_all_vars.data_vars:
-                                day_ds_all_vars[var_name] = ds_loaded[var_name]
-                buffer_days.append(day_ds_all_vars)
+            missing_vars = []
+            for var in variables_to_process:
+                outname_day_var = os.path.join(outdir, f"{day}_{dataset}_{obs_type}_{var}.nc")
+                if not os.path.exists(outname_day_var):
+                    missing_vars.append(var)
+
+            if len(missing_vars) == 0:
+                print(f"  [{day_idx}/{len(days_list)}] Day {day}: all variable day-files cached")
                 continue
 
+            print(f"  [{day_idx}/{len(days_list)}] Processing day {day} (missing vars: {missing_vars})")
             filledPath = (conf_model.datasets.models[dataset].path).format(experiment=dataset, day=day)
             print(f"    Searching: {filledPath}")
             files = natsorted(glob(filledPath))
             if len(files) == 0:
                 print(f"    ⚠ No files found for {dataset} on {day}")
                 continue
-            
-            print(f"    Found {len(files)} file(s)")
 
             try:
-                # Load model for that day with optimizations
-                print(f"    Loading model data...")
-                
-                # Get observation bounding box for spatial subsetting (add buffer)
+                print(f"    Loading model data once for day {day}...")
                 obs_lons = sat['longitude'].values
                 obs_lats = sat['latitude'].values
                 lon_min, lon_max = obs_lons.min() - 0.5, obs_lons.max() + 0.5
                 lat_min, lat_max = obs_lats.min() - 0.5, obs_lats.max() + 0.5
                 print(f"    Obs bbox: lon=[{lon_min:.2f}, {lon_max:.2f}], lat=[{lat_min:.2f}, {lat_max:.2f}]")
-                
-                # Detect format and load accordingly
+
                 if len(files) == 1 and detect_format(files[0]) == 'zarr':
-                    # Single Zarr store
                     print(f"    Reading Zarr format: {files[0]}")
                     model = xr.open_zarr(files[0], chunks={'time': 24})
                 elif any(detect_format(f) == 'zarr' for f in files):
-                    # Multiple Zarr stores - open and concatenate
                     print(f"    Reading {len(files)} Zarr stores...")
                     datasets = [xr.open_zarr(f, chunks={'time': 24}) for f in files]
                     model = xr.concat(datasets, dim='time')
                 else:
-                    # NetCDF files
                     model = xr.open_mfdataset(files, combine="by_coords", chunks={'time': 24})
-                
+
                 varnames = conf_model.datasets.models[dataset]
                 model = preprocesser(model, varnames)
-                
-                # Spatial subset if using regular grid
                 model_type = conf_model.datasets.models[dataset].type.lower()
                 if model_type in ['reg', 'regular', 'cf', 'cf_compl', 'cf_compliant']:
                     lon_var = varnames.lon
                     lat_var = varnames.lat
                     if lon_var in model.coords and lat_var in model.coords:
-                        # Check if coords are 1D
                         if model[lon_var].ndim == 1 and model[lat_var].ndim == 1:
                             lon_vals = model[lon_var].values
                             lat_vals = model[lat_var].values
@@ -750,61 +811,41 @@ def submit(conf_path: str, start_date: str, end_date: str, obs_type: str = 'sat'
 
                 itp = getattr(conf_model.datasets.models[dataset], "interp_type", "nearest")
                 print(f"    Interpolation method: {itp}")
-                
-                # Process all variables for this day
-                t0 = time.time()
-                daily_ds_all_vars = None
-                
-                for var in variables_to_process:
-                    print(f"      Processing variable: {var}")
-                    
-                    if itp in ["linear", "bilinear", "barycentric", "auto"]:
-                        daily_ds_var = getSeriesLinear(model, sat, conf_model, conf_sat, dataset, obs_path, var)
-                    else:
-                        daily_ds_var = getSeries(model, sat, conf_model, conf_sat, dataset, obs_path, var)
-                    
-                    if daily_ds_var is not None:
-                        if daily_ds_all_vars is None:
-                            daily_ds_all_vars = daily_ds_var
-                        else:
-                            # Merge variables into same dataset
-                            for var_name in daily_ds_var.data_vars:
-                                if var_name not in daily_ds_all_vars.data_vars:
-                                    daily_ds_all_vars[var_name] = daily_ds_var[var_name]
-                    else:
-                        print(f"      ⚠ No data for {var}")
-                
-                elapsed = time.time() - t0
-                print(f"    Interpolation completed in {elapsed:.1f}s")
 
-                if daily_ds_all_vars is not None:
-                    # Save daily cache files (per-variable)
-                    for var in variables_to_process:
-                        var_name = f"model_{var}"
-                        if var_name in daily_ds_all_vars.data_vars:
-                            # Create dataset with observation metadata + this variable's data
-                            var_ds = xr.Dataset(
-                                data_vars={
-                                    var: daily_ds_all_vars[var],
-                                    var_name: daily_ds_all_vars[var_name],
-                                },
-                                coords={
-                                    'obs': daily_ds_all_vars.coords['obs'],
-                                    'model': [dataset]  # Use model name, not integer
-                                },
-                            )
-                            # Copy coordinate variables (time, lon, lat, etc.)
-                            for coord_var in ['time', 'longitude', 'latitude', 'station', 'satellite']:
-                                if coord_var in daily_ds_all_vars.data_vars:
-                                    var_ds[coord_var] = daily_ds_all_vars[coord_var]
-                            
-                            outname_day_var = os.path.join(outdir, f"{day}_{dataset}_{obs_type}_{var}.nc")
-                            save_dataset_flexible(var_ds, outname_day_var)
-                    
-                    print(f"    ✓ Cached: per-variable files ({len(daily_ds_all_vars.obs)} obs)")
-                    buffer_days.append(daily_ds_all_vars)
-                else:
-                    print(f"    ⚠ No data returned for {day}")
+                for var in missing_vars:
+                    print(f"      Processing variable: {var}")
+                    # For buoy data, use variable-specific observations; for satellite, use single dataset
+                    sat_var = sat_by_var.get(var) if obs_type == 'buoy' else sat
+                    if itp in ["linear", "bilinear", "barycentric", "auto"]:
+                        daily_ds_var = getSeriesLinear(model, sat_var, conf_model, conf_sat, dataset, obs_path, var)
+                    else:
+                        daily_ds_var = getSeries(model, sat_var, conf_model, conf_sat, dataset, obs_path, var)
+
+                    if daily_ds_var is None:
+                        print(f"      ⚠ No data for {var}")
+                        continue
+
+                    var_name = f"model_{var}"
+                    obs_var_name = var if var in daily_ds_var.data_vars else None
+                    if obs_var_name is None:
+                        mapped_var = _resolve_model_variable(conf_model.datasets.models[dataset], var)
+                        if mapped_var in daily_ds_var.data_vars:
+                            obs_var_name = mapped_var
+
+                    data_vars = {var_name: daily_ds_var[var_name]}
+                    if obs_var_name is not None:
+                        data_vars[var] = daily_ds_var[obs_var_name]
+
+                    var_ds = xr.Dataset(
+                        data_vars=data_vars,
+                        coords={'obs': daily_ds_var.coords['obs'], 'model': [dataset]},
+                    )
+                    for coord_var in ['time', 'longitude', 'latitude', 'station', 'satellite']:
+                        if coord_var in daily_ds_var.data_vars:
+                            var_ds[coord_var] = daily_ds_var[coord_var]
+
+                    outname_day_var = os.path.join(outdir, f"{day}_{dataset}_{obs_type}_{var}.nc")
+                    save_dataset_flexible(var_ds, outname_day_var)
 
             except Exception as e:
                 print(f"    ✗ ERROR: {dataset} {day} failed: {e}")
@@ -812,170 +853,167 @@ def submit(conf_path: str, start_date: str, end_date: str, obs_type: str = 'sat'
                 traceback.print_exc()
                 continue
 
-        if len(buffer_days) == 0:
-            print(f"\n  ⚠ No output created for dataset {dataset} (no valid days)\n")
-            continue
+        # 2) Merge per-day files into per-model, per-variable files
+        for var in variables_to_process:
+            outname_ds = os.path.join(outdir, f"{date}_{dataset}_{output_suffix}_{var}.nc")
+            if os.path.exists(outname_ds):
+                print(f"  ✓ Using cached model-variable file: {dataset} - {var}")
+                per_model_var_paths[var][dataset] = outname_ds
+                continue
 
-        print(f"\n  Concatenating {len(buffer_days)} day(s) for {dataset}...")
-        ds_model_out = xr.concat(buffer_days, dim="obs")
-        print(f"  Saving per-model file: {os.path.basename(outname_ds)}")
-        ds_model_out.to_netcdf(outname_ds)
-        print(f"  ✓ {dataset}: {len(ds_model_out.obs)} observations (indices from ALLSAT)\n")
-        buffer_all.append(ds_model_out)
+            per_day_var_files = []
+            for day in days_list:
+                outname_day_var = os.path.join(outdir, f"{day}_{dataset}_{obs_type}_{var}.nc")
+                if os.path.exists(outname_day_var):
+                    per_day_var_files.append(outname_day_var)
 
-    if len(buffer_all) == 0:
-        raise RuntimeError("No datasets produced any output.")
+            if len(per_day_var_files) == 0:
+                print(f"\n  ⚠ No output created for dataset {dataset}, variable {var} (no valid days)\n")
+                continue
 
-    print(f"\n{'='*60}")
-    print(f"CREATING MERGED OUTPUT FILES (PER VARIABLE)")
-    print(f"{'='*60}")
-    print(f"Merging {len(buffer_all)} model dataset(s)...")
-    print(f"Variables to process: {variables_to_process}\n")
-    
-    # Get UNION of obs indices across all models (obs is not necessarily dense!)
-    all_obs_indices = []
-    for ds in buffer_all:
-        all_obs_indices.append(ds.obs.values)
-    obs_union = np.unique(np.concatenate(all_obs_indices)) if all_obs_indices else np.array([])
-    n_valid = len(obs_union)
-    
-    obs_counts = [len(ds.obs) for ds in buffer_all]
-    print(f"  Observation counts per model: {obs_counts}")
-    print(f"  Union of all obs indices: {n_valid} unique obs")
-    
-    # Use first model as base for observation metadata
-    ds_base = buffer_all[0].load()
-    
-    # Create mapping from obs index to position in union
-    obs_to_idx = {obs_val: i for i, obs_val in enumerate(obs_union)}
-    
-    # Create observation dataset from base (use only obs that are in union)
-    base_obs_mask = np.isin(ds_base.obs.values, obs_union)
-    obs_subset_indices = [obs_to_idx[obs_val] for obs_val in ds_base.obs.values if obs_val in obs_union]
-    
-    obs_vars = {
-        'time': ds_base['time'].isel(obs=base_obs_mask),
-        'longitude': ds_base['longitude'].isel(obs=base_obs_mask),
-        'latitude': ds_base['latitude'].isel(obs=base_obs_mask),
-        'hs': ds_base['hs'].isel(obs=base_obs_mask),
-    }
-    
-    # Add station or satellite identifier if present
-    if 'station' in ds_base.data_vars:
-        obs_vars['station'] = ds_base['station'].isel(obs=base_obs_mask)
-    elif 'satellite' in ds_base.data_vars:
-        obs_vars['satellite'] = ds_base['satellite'].isel(obs=base_obs_mask)
-    
-    # Collect model predictions aligned by obs INDEX for each variable
-    model_vals_by_var = {}  # variable -> (n_valid, n_models) array
-    
-    # Pre-build obs index mapping for fast O(1) lookups (replaces searchsorted approach)
-    obs_to_idx = {obs_val: i for i, obs_val in enumerate(obs_union)}
-    
+            print(f"\n  Concatenating {len(per_day_var_files)} day(s) for {dataset}, variable {var}...")
+            ds_list = []
+            for fpath in per_day_var_files:
+                ds_part = open_dataset_flexible(fpath)
+                ds_list.append(ds_part.load())
+                if hasattr(ds_part, "close"):
+                    ds_part.close()
+            ds_model_out = xr.concat(ds_list, dim='obs')
+            print(f"  Saving per-model, per-variable file: {os.path.basename(outname_ds)}")
+            save_dataset_flexible(ds_model_out, outname_ds)
+            print(f"  ✓ {dataset}, {var}: {len(ds_model_out.obs)} observations (indices from ALLSAT)\n")
+            per_model_var_paths[var][dataset] = outname_ds
+
+    # For buoy data, each variable has independent obs; for satellite, all variables share obs
+    obs_ref_by_var = {}
     for variable in variables_to_process:
-        print(f"    Aligning {variable} predictions across {len(buffer_all)} model(s)...")
-        model_vals = np.full((n_valid, len(buffer_all)), np.nan, dtype=np.float32)  # (obs, model)
+        if obs_type == 'buoy':
+            obs_ref_by_var[variable] = sat_by_var[variable]['obs'].values
+        else:
+            obs_ref_by_var[variable] = sat['obs'].values
+    
+    # Use first variable's obs as reference for output structure (for metadata)
+    first_var = variables_to_process[0]
+    obs_ref = obs_ref_by_var[first_var]
+    n_valid = len(obs_ref)
+
+    # Collect model predictions aligned by obs index for each variable independently
+    model_vals_by_var = {}  # variable -> (nobs_var, n_models) array
+    for variable in variables_to_process:
+        obs_ref_var = obs_ref_by_var[variable]
+        n_obs_var = len(obs_ref_var)
         
-        for model_idx, ds in enumerate(buffer_all):
+        print(f"    Aligning {variable} predictions across {len(model_names)} model(s)...")
+        print(f"      Variable obs count: {n_obs_var}")
+        
+        model_vals = np.full((n_obs_var, len(model_names)), np.nan, dtype=np.float32)  # (obs, model)
+        ref_obs_to_idx = {obs: i for i, obs in enumerate(obs_ref_var)}
+        
+        for model_idx, model_name in enumerate(model_names):
+            path_model_var = per_model_var_paths.get(variable, {}).get(model_name)
+            if not path_model_var or not os.path.exists(path_model_var):
+                continue
+            ds = open_dataset_flexible(path_model_var)
             var_name = f"model_{variable}"
             if var_name not in ds.data_vars:
-                continue  # This model doesn't have predictions for this variable
-            
+                if hasattr(ds, "close"):
+                    ds.close()
+                continue
             vals = ds[var_name].values
             if vals.ndim == 2:
-                vals = vals[:, 0]  # Extract from (obs, model) to (obs,)
-            
-            # Fast O(1) dictionary lookup approach instead of searchsorted
+                vals = vals[:, 0]
             ds_obs = ds.obs.values
-            for local_idx, obs_val in enumerate(ds_obs):
-                if obs_val in obs_to_idx:  # O(1) lookup
-                    global_idx = obs_to_idx[obs_val]
-                    model_vals[global_idx, model_idx] = vals[local_idx]
-        
+
+            # Deterministic alignment on obs index:
+            # - sort by obs
+            # - de-duplicate obs indices (keep first occurrence)
+            if ds_obs.size > 0:
+                order = np.argsort(ds_obs)
+                ds_obs_sorted = ds_obs[order]
+                vals_sorted = vals[order]
+                unique_obs, first_idx = np.unique(ds_obs_sorted, return_index=True)
+                vals_unique = vals_sorted[first_idx]
+
+                matched_count = 0
+                for local_idx, obs_val in enumerate(unique_obs):
+                    ref_idx = ref_obs_to_idx.get(obs_val)
+                    if ref_idx is not None:
+                        model_vals[ref_idx, model_idx] = vals_unique[local_idx]
+                        matched_count += 1
+                print(f"      {model_name}: matched {matched_count}/{n_obs_var} obs for {variable}")
+
+            if hasattr(ds, "close"):
+                ds.close()
         model_vals_by_var[variable] = model_vals
-    
-    # Step 3: Create per-variable merged datasets with proper obs index alignment
+
     print(f"\n  Creating per-variable merged datasets...\n")
-    
-    ds_merged_all = None  # For return value
-    
-    model_names = list(conf_model.datasets.models.keys())
-    
     for var_idx, variable in enumerate(variables_to_process, 1):
-        outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{variable}.nc")
+        if obs_type == 'sat':
+            outname_var = os.path.join(outdir, f"{date}_{output_suffix}.nc")
+        else:
+            outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{variable}.nc")
         
         print(f"  [{var_idx}/{len(variables_to_process)}] Creating {os.path.basename(outname_var)} ({variable})")
         
-        # Build observation data aligned with obs_union indices
+        # Load metadata from variable-specific observation file
+        ds_base = sat_by_var.get(variable) if obs_type == 'buoy' else sat
+        if ds_base is None:
+            print(f"    ⚠ Skipping {variable}: no observation data")
+            continue
+        
+        ds_base = ds_base.load()
+        obs_ref_var = obs_ref_by_var[variable]
+        n_obs_var = len(obs_ref_var)
+        
         data_vars = {}
-        coords_data = {'obs': obs_union, 'model': model_names}
+        coords_data = {'obs': obs_ref_var, 'model': model_names}
         
-        # For each obs index in obs_union, find corresponding data from ds_base
-        obs_idx_to_base = {obs_val: i for i, obs_val in enumerate(ds_base.obs.values)}
+        # Use metadata from variable's observation file
+        if 'time' in ds_base.data_vars:
+            data_vars['time'] = (('obs',), ds_base['time'].values)
+        if 'longitude' in ds_base.data_vars:
+            data_vars['longitude'] = (('obs',), ds_base['longitude'].values)
+        if 'latitude' in ds_base.data_vars:
+            data_vars['latitude'] = (('obs',), ds_base['latitude'].values)
         
-        # Initialize arrays with correct size (n_valid)
-        time_vals = np.full(n_valid, np.datetime64('NaT'), dtype='datetime64[ns]')
-        lon_vals = np.full(n_valid, np.nan, dtype=np.float64)
-        lat_vals = np.full(n_valid, np.nan, dtype=np.float64)
+        # Add observation variable if it exists
+        if variable in ds_base.data_vars:
+            data_vars[variable] = (('obs',), ds_base[variable].values)
         
-        var_vals = np.full(n_valid, np.nan, dtype=np.float32)
-        model_var_vals = model_vals_by_var.get(variable, np.full((n_valid, len(buffer_all)), np.nan, dtype=np.float32))
+        # Add model predictions for this variable
+        model_vals_var = model_vals_by_var.get(variable, np.full((n_obs_var, len(model_names)), np.nan, dtype=np.float32))
+        data_vars[f"model_{variable}"] = (('obs', 'model'), model_vals_var)
         
-        # Optional: station/satellite identifiers
-        has_station = 'station' in ds_base.data_vars
-        has_satellite = 'satellite' in ds_base.data_vars
-        if has_station:
-            station_vals = np.full(n_valid, '', dtype=object)
-        elif has_satellite:
-            satellite_vals = np.full(n_valid, '', dtype=object)
-        
-        # Fill in values from ds_base for each obs index
-        for global_idx, obs_val in enumerate(obs_union):
-            if obs_val in obs_idx_to_base:
-                base_idx = obs_idx_to_base[obs_val]
-                time_vals[global_idx] = ds_base['time'].values[base_idx]
-                lon_vals[global_idx] = ds_base['longitude'].values[base_idx]
-                lat_vals[global_idx] = ds_base['latitude'].values[base_idx]
-                
-                if variable in ds_base.data_vars:
-                    var_vals[global_idx] = ds_base[variable].values[base_idx]
-                
-                if has_station:
-                    station_vals[global_idx] = ds_base['station'].values[base_idx]
-                elif has_satellite:
-                    satellite_vals[global_idx] = ds_base['satellite'].values[base_idx]
-        
-        # Assign to data_vars
-        data_vars['time'] = (('obs',), time_vals)
-        data_vars['longitude'] = (('obs',), lon_vals)
-        data_vars['latitude'] = (('obs',), lat_vals)
-        data_vars[variable] = (('obs',), var_vals)
-        data_vars[f"model_{variable}"] = (('obs', 'model'), model_var_vals)
-        
-        if has_station:
-            data_vars['station'] = (('obs',), station_vals)
-        elif has_satellite:
-            data_vars['satellite'] = (('obs',), satellite_vals)
+        # Add station or satellite identifier if present
+        if 'station' in ds_base.data_vars:
+            data_vars['station'] = (('obs',), ds_base['station'].values)
+        elif 'satellite' in ds_base.data_vars:
+            data_vars['satellite'] = (('obs',), ds_base['satellite'].values)
         
         ds_out = xr.Dataset(data_vars=data_vars, coords=coords_data)
-        
         save_dataset_flexible(ds_out, outname_var)
-        print(f"      ✓ Saved: {len(ds_out.obs)} observations")
+        print(f"      ✓ Saved: {n_obs_var} observations")
     
     print(f"\n✓ Saved per-variable outputs:")
     for variable in variables_to_process:
-        outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{variable}.nc")
+        if obs_type == 'sat':
+            outname_var = os.path.join(outdir, f"{date}_{output_suffix}.nc")
+        else:
+            outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{variable}.nc")
         if os.path.exists(outname_var):
-            print(f"  ✓ {variable}: {outname_var}")
-    
-    print(f"  Total observations: {n_valid}")
+            ds_check = open_dataset_flexible(outname_var)
+            n_obs_check = len(ds_check.obs)
+            if hasattr(ds_check, "close"):
+                ds_check.close()
+            print(f"  ✓ {variable}: {n_obs_check} observations")
     print(f"  Models: {list(conf_model.datasets.models.keys())}")
     print(f"  Variables: {variables_to_process}")
     print(f"\n{'='*60}")
     print(f"PROCESSING COMPLETE")
     print(f"{'='*60}\n")
-    
-    # Return first variable dataset
     first_var = variables_to_process[0]
-    outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{first_var}.nc")
+    if obs_type == 'sat':
+        outname_var = os.path.join(outdir, f"{date}_{output_suffix}.nc")
+    else:
+        outname_var = os.path.join(outdir, f"{date}_{output_suffix}_{first_var}.nc")
     return open_dataset_flexible(outname_var)
